@@ -1,0 +1,27 @@
+# Repository Info
+
+- **Project**: WoWonder PHP Social Networking Platform
+- **Root**: c:\xampp\htdocs\wowonder\onlycpls
+- **Entry points**:
+  - index.php (frontend)
+  - admincp.php (admin)
+  - api.php / api-v2.php (API)
+  - cron-job.php (cron)
+- **Install**:
+  - Web installer at /install
+  - Database schema: wowonder.sql
+  - Config: config.php ($sql_db_host, $sql_db_user, $sql_db_pass, $sql_db_name, $site_url)
+- **Writable dirs**:
+  - cache/
+  - upload/
+  - ffmpeg/ (if used)
+- **Server requirements**:
+  - PHP 8.0–8.1 with extensions: curl, mbstring, pdo_mysql, gd, zip, xml, fileinfo
+  - MySQL 5.7+/MariaDB 10+
+  - Apache with mod_rewrite (uses .htaccess)
+- **Special files**:
+  - .htaccess (rewrites)
+  - .user.ini (PHP limits)
+- **Notes**:
+  - After installation, remove or rename /install.
+  - For Hostinger shared plans FFmpeg may not be available. Disable video conversion/live streaming or use VPS/Cloud.

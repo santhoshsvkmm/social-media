@@ -1,0 +1,26 @@
+/* Optimized admin CSS - Load only essential styles */
+.barloading {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 3px;
+    background: #C32E3A;
+    z-index: 9999;
+}
+
+/* Reduce animation overhead */
+.preloader {
+    display: none !important;
+}
+
+/* Optimize navigation rendering */
+.navigation-menu-body ul li {
+    will-change: auto;
+}
+
+/* Reduce reflow/repaint */
+.content {
+    contain: layout style;
+}
