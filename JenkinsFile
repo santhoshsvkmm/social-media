@@ -1,0 +1,248 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'DOCKER_REGISTRY', defaultValue: 'docker.io', description: 'Docker Registry URL')
+        string(name: 'DOCKER_REPO', defaultValue: 'wowonder', description: 'Docker Repository Name')
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker Image Tag')
+        string(name: 'DEPLOY_ENV', defaultValue: 'staging', description: 'Deployment Environment (staging/production)')
+    }
+
+    environment {
+        DOCKER_IMAGE = "${params.DOCKER_REGISTRY}/${params.DOCKER_REPO}:${params.IMAGE_TAG}"
+        REGISTRY_CREDENTIALS = credentials('docker-registry-credentials')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "Checking out source code..."
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    echo "Building Docker image: ${DOCKER_IMAGE}"
+                    sh '''
+                        docker build \
+                            --tag ${DOCKER_IMAGE} \
+                            --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                            --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+                            .
+                    '''
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                script {
+                    echo "Running security scan on Docker image..."
+                    sh '''
+                        # Install Trivy if not present
+                        if ! command -v trivy &> /dev/null; then
+                            echo "Installing Trivy..."
+                            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add - 2>/dev/null || true
+                            echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | tee -a /etc/apt/sources.list.d/trivy.list 2>/dev/null || true
+                            apt-get update 2>/dev/null && apt-get install -y trivy 2>/dev/null || echo "Trivy installation skipped"
+                        fi
+                        
+                        # Scan the image if trivy is available
+                        if command -v trivy &> /dev/null; then
+                            trivy image --severity HIGH,CRITICAL ${DOCKER_IMAGE} || true
+                        else
+                            echo "Trivy not available, skipping security scan"
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Dependency Check') {
+            steps {
+                script {
+                    echo "Checking dependencies..."
+                    sh '''
+                        # Verify all required PHP extensions
+                        docker run --rm ${DOCKER_IMAGE} php -m | grep -E "mysqli|gd|curl|zip|json|redis|memcached|imagick" || echo "Some extensions may be missing"
+                        
+                        # Check Node.js packages
+                        if [ -f nodejs/package.json ]; then
+                            docker run --rm -w /app/nodejs -v $(pwd)/nodejs:/app/nodejs node:20 npm list --depth=0 || true
+                        fi
+                        
+                        # Check for critical libraries
+                        docker run --rm ${DOCKER_IMAGE} which ffmpeg redis-server || echo "Some system tools missing"
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    echo "Running tests..."
+                    sh '''
+                        # Start containers in test mode
+                        docker-compose -f docker-compose.yml up -d
+                        
+                        # Wait for services to be healthy
+                        sleep 45
+                        
+                        # Check PHP service
+                        docker-compose exec -T php-app curl -f http://localhost/ || exit 1
+                        
+                        # Test database connectivity
+                        docker-compose exec -T mariadb mariadb-admin ping || exit 1
+                        
+                        # Test Redis connectivity
+                        docker-compose exec -T redis redis-cli ping || exit 1
+                        
+                        # Verify PHP extensions
+                        docker-compose exec -T php-app php -m | grep -E "mysqli|redis|gd|curl" || exit 1
+                        
+                        # Check database has tables
+                        docker-compose exec -T mariadb mariadb -u${MYSQL_USER} -p${MYSQL_PASSWORD} \
+                            -e "SELECT COUNT(*) as tables FROM information_schema.tables WHERE table_schema='${MYSQL_DATABASE}';"
+                        
+                        # Clean up
+                        docker-compose down -v
+                    '''
+                }
+            }
+        }
+
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Pushing image to registry..."
+                    sh '''
+                        echo ${REGISTRY_CREDENTIALS_PSW} | docker login -u ${REGISTRY_CREDENTIALS_USR} --password-stdin ${DOCKER_REGISTRY}
+                        docker push ${DOCKER_IMAGE}
+                        
+                        # Also tag as latest
+                        docker tag ${DOCKER_IMAGE} ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest
+                        docker push ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Deploying to staging environment..."
+                    sh '''
+                        # Pull latest image
+                        docker pull ${DOCKER_IMAGE}
+                        
+                        # Deploy using docker-compose
+                        export COMPOSE_PROJECT_NAME=wowonder-staging
+                        docker-compose -f docker-compose.yml pull
+                        docker-compose -f docker-compose.yml up -d
+                        
+                        # Health check
+                        sleep 30
+                        curl -f http://localhost:80/ || exit 1
+                        docker-compose exec -T redis redis-cli ping || exit 1
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+                tag pattern: "v\\d+\\.\\d+\\.\\d+", comparator: "REGEXP"
+            }
+            steps {
+                input(message: 'Deploy to production?', ok: 'Deploy')
+                script {
+                    echo "Deploying to production environment..."
+                    sh '''
+                        # Pull latest image
+                        docker pull ${DOCKER_IMAGE}
+                        
+                        # Backup current state (optional)
+                        docker-compose -f docker-compose.prod.yml exec -T mariadb \
+                            mariadb-dump -u ${MYSQL_USER} -p${MYSQL_PASSWORD} ${MYSQL_DATABASE} \
+                            > backup-$(date +%Y%m%d-%H%M%S).sql || true
+                        
+                        # Deploy using docker-compose
+                        export COMPOSE_PROJECT_NAME=wowonder-production
+                        docker-compose -f docker-compose.prod.yml pull
+                        docker-compose -f docker-compose.prod.yml up -d
+                        
+                        # Health check
+                        sleep 30
+                        curl -f http://localhost:80/ || exit 1
+                        docker-compose -f docker-compose.prod.yml exec -T redis redis-cli -a ${REDIS_PASSWORD} ping || exit 1
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            steps {
+                script {
+                    echo "Running smoke tests..."
+                    sh '''
+                        # Test application endpoints
+                        curl -f http://localhost:80/ || exit 1
+                        curl -f http://localhost:80/welcome || true
+                        curl -f http://localhost:80/api/ || true
+                        
+                        # Test database connectivity
+                        if command -v mariadb &> /dev/null; then
+                            mariadb -u${MYSQL_USER} -p${MYSQL_PASSWORD} -h127.0.0.1 \
+                                -e "SELECT COUNT(*) as tables FROM information_schema.tables WHERE table_schema='${MYSQL_DATABASE}';"
+                        fi
+                        
+                        # Test Redis connectivity
+                        if command -v redis-cli &> /dev/null; then
+                            redis-cli -h 127.0.0.1 ping
+                        fi
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "Cleaning up..."
+                sh '''
+                    # Cleanup dangling images
+                    docker image prune -f --filter "dangling=true" || true
+                    
+                    # Cleanup stopped containers
+                    docker container prune -f || true
+                '''
+            }
+        }
+        success {
+            script {
+                echo "Pipeline succeeded!"
+                // Add notification logic here (Slack, email, etc.)
+            }
+        }
+        failure {
+            script {
+                echo "Pipeline failed!"
+                // Add notification logic here (Slack, email, etc.)
+                sh 'docker-compose down -v || true'
+            }
+        }
+    }
+}

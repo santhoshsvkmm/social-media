@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  # Redis Cache & Session Storage
+  redis:
+    image: redis:7-alpine
+    container_name: wowonder-redis
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - wowonder-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      timeout: 10s
+      retries: 5
+      interval: 5s
+    restart: unless-stopped
+
+  # MariaDB Database Service
+  mariadb:
+    image: mariadb:10.11
+    container_name: wowonder-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wowonder}
+      MYSQL_USER: ${MYSQL_USER:-wowonder_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-wowonder_pass}
+      TZ: 'UTC'
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./wowonder.sql:/docker-entrypoint-initdb.d/wowonder.sql
+    networks:
+      - wowonder-network
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+      interval: 10s
+    restart: unless-stopped
+
+  # PHP Web Application Service
+  php-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wowonder-app
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOST: mariadb
+      DB_USER: ${MYSQL_USER:-wowonder_user}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-wowonder_pass}
+      DB_NAME: ${MYSQL_DATABASE:-wowonder}
+      DB_PORT: 3306
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:-256M}
+      PHP_MAX_UPLOAD_SIZE: ${PHP_MAX_UPLOAD_SIZE:-50M}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./:/var/www/html
+      - ./docker/php.ini:/usr/local/etc/php/conf.d/custom.ini
+      - apache_logs:/var/log/apache2
+    networks:
+      - wowonder-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      timeout: 10s
+      retries: 3
+      interval: 30s
+
+  # Node.js Real-time Server (Optional)
+  nodejs-server:
+    image: node:20
+    container_name: wowonder-realtime
+    working_dir: /app/nodejs
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DB_HOST: mariadb
+      DB_USER: ${MYSQL_USER:-wowonder_user}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-wowonder_pass}
+      DB_NAME: ${MYSQL_DATABASE:-wowonder}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./nodejs:/app/nodejs
+    depends_on:
+      - mariadb
+      - redis
+      - php-app
+    networks:
+      - wowonder-network
+    command: npm start
+    restart: unless-stopped
+    profiles:
+      - realtime
+
+volumes:
+  mariadb_data:
+    driver: local
+  redis_data:
+    driver: local
+  apache_logs:
+    driver: local
+
+networks:
+  wowonder-network:
+    driver: bridge
